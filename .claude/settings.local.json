@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(docker compose logs --tail 20 consumer-standard 2>&1)"
+    ]
+  }
+}

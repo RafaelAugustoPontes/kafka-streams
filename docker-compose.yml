@@ -1,0 +1,77 @@
+services:
+  # -------------------------------------------------------------------------
+  # Broker Kafka em modo KRaft (sem Zookeeper) - node unico, so para a demo.
+  # -------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.7.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"    # acesso de dentro da rede docker (kafka:9092)
+      - "29092:29092"  # acesso a partir do host (localhost:29092)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # -------------------------------------------------------------------------
+  # Producer - gera trades da B3 (lib padrao / KafkaProducer)
+  # -------------------------------------------------------------------------
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    container_name: producer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # Consumer com a LIB PADRAO (kafka-clients / KafkaConsumer)
+  # -------------------------------------------------------------------------
+  consumer-standard:
+    build:
+      context: .
+      dockerfile: consumer-standard/Dockerfile
+    container_name: consumer-standard
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+      producer:
+        condition: service_started
+
+  # -------------------------------------------------------------------------
+  # Consumer com KAFKA STREAMS
+  # -------------------------------------------------------------------------
+  consumer-streams:
+    build:
+      context: .
+      dockerfile: consumer-streams/Dockerfile
+    container_name: consumer-streams
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+      producer:
+        condition: service_started
