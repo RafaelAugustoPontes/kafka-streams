@@ -203,36 +203,6 @@ Compare a **mesma conta**, na **mesma janela**, nos dois terminais:
 
 ---
 
-## ❓ Perguntas prováveis (respostas curtas)
-
-- **"Precisa subir um cluster novo?"**
-  Não. É uma biblioteca Java — roda como qualquer app nosso, num JAR.
-
-- **"E se eu subir 2 instâncias do consumidor Streams?"**
-  Com o mesmo `application.id`, o Kafka redistribui as partições entre elas
-  automaticamente. Escala horizontal de graça.
-
-- **"Onde exatamente fica o estado?"**
-  Local (RocksDB/memória), com backup contínuo num tópico interno de *changelog*
-  no próprio Kafka. Por isso sobrevive a restart — foi o que acabamos de ver.
-
-- **"Serve para ler de banco / chamar API externa?"**
-  Não diretamente — Streams é Kafka → Kafka. Para integrar com sistemas externos,
-  o par dele é o Kafka Connect (ou o seu próprio código).
-
-- **"E exactly-once?"**
-  Uma linha: `processing.guarantee=exactly_once_v2`. Na lib padrão, é um trabalho
-  considerável de transações manuais.
-
-- **"Dá para fazer tudo isso na lib padrão?"**
-  Dá — e foi o que fizemos no `consumer-standard`. A questão não é *possível*,
-  é **quanto código seu você quer escrever, testar e manter**.
-
-- **"Por que o producer não usa Streams?"**
-  Porque produzir é igual nas duas abordagens. Streams é sobre **processar**.
-
----
-
 ## 🧹 DEPOIS DA APRESENTAÇÃO
 
 ```bash
@@ -250,3 +220,118 @@ docker compose down
 | Contagens não batem entre os dois | Suba do zero: `docker compose down` e `docker compose up --build -d` |
 | Build muito lento | Normal na 1ª vez (baixa imagens + dependências Maven). Faça antes. |
 | Quer inspecionar o tópico cru | `docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic transactions --from-beginning` |
+
+---
+---
+
+# ❓ PERGUNTAS QUE PODEM TE FAZER
+
+> Respostas diretas ao ponto. Se não souber alguma, a melhor resposta é
+> **"não sei, vou levantar e te respondo"** — nunca invente.
+
+## 🔧 Sobre a ferramenta
+
+**"Precisa subir um cluster novo? Um servidor a mais?"**
+Não. É uma **biblioteca Java**, uma dependência no `pom.xml`. Roda como qualquer
+app nosso, num JAR. Zero infraestrutura nova.
+
+**"Então qual a diferença para o Spark Streaming / Flink?"**
+Spark e Flink são **frameworks distribuídos** — exigem um cluster próprio para
+operar. Kafka Streams é só uma **lib** dentro do seu app. Menos poder para
+cenários gigantes e multi-fonte, muito menos complexidade operacional.
+
+**"E o ksqlDB? Faz a mesma coisa?"**
+Por baixo, o ksqlDB **é Kafka Streams**, com uma camada de SQL por cima. Bom para
+quem não quer escrever Java. Kafka Streams te dá mais controle e cabe no nosso
+build/deploy normal.
+
+**"Precisa de Schema Registry / Avro?"**
+Não. Aqui usamos JSON com um Serde próprio. Avro + Schema Registry é uma boa
+prática para contratos entre times, mas é ortogonal — não é requisito do Streams.
+
+## 💾 Sobre estado e falhas
+
+**"Onde exatamente fica o estado?"**
+Local na instância (RocksDB ou memória), com **backup contínuo num tópico interno
+do Kafka** (o *changelog*). Por isso sobrevive a restart — foi o que a gente
+acabou de ver na demo.
+
+**"Se a máquina morrer de vez, o estado vai junto?"**
+Não. O estado local se perde, mas o **changelog está no Kafka**. Uma nova
+instância lê esse tópico e **reconstrói o estado**. Foi exatamente isso que o
+`--force-recreate` provou: subiu com disco vazio e voltou com o número certo.
+
+**"Essa reconstrução não é lenta?"**
+Pode ser, se o estado for grande — é uma desvantagem real. Mitigações: *standby
+replicas* (réplicas quentes do estado em outras instâncias) e volumes
+persistentes, que evitam a restauração completa.
+
+**"Quanto de disco/memória isso consome?"**
+Depende do número de chaves e do tamanho das janelas. Estado grande **pesa** — e
+essa é uma das desvantagens que citei. Precisa ser dimensionado, não é mágica.
+
+## ⚙️ Sobre escala e operação
+
+**"E se eu subir 2 instâncias do consumidor Streams?"**
+Com o **mesmo `application.id`**, o Kafka redistribui as partições entre elas
+automaticamente — cada instância fica com um pedaço do estado. Escala horizontal
+de graça.
+
+**"E se eu tiver mais instâncias do que partições?"**
+As sobrando ficam **ociosas**. O paralelismo máximo é o número de partições —
+igualzinho ao consumer group da lib padrão.
+
+**"Quem cria esses tópicos internos?"**
+O próprio Kafka Streams, na inicialização. Eles aparecem com o prefixo do
+`application.id`. **É importante o time saber que eles existem** — contam no
+monitoramento, no disco do broker e nas políticas de retenção.
+
+**"Como a gente monitora isso em produção?"**
+O Streams expõe métricas via **JMX** (lag, throughput, tempo de restauração,
+estado das threads). Integra com Prometheus/Grafana como qualquer app JVM.
+
+## 🤔 Sobre a decisão (as mais importantes)
+
+**"Dá para fazer tudo isso na lib padrão?"**
+**Dá — e foi o que eu fiz no `consumer-standard`.** A questão nunca foi
+*possível*. É **quanto código seu você quer escrever, testar e manter**.
+
+**"Então devemos migrar tudo para Streams?"**
+**Não.** Para consumo sem estado — ler, validar, chamar serviço, gravar no banco —
+a lib padrão é melhor: mais simples e todo mundo já domina. Migre só o que é
+**stateful**.
+
+**"Por que o producer não usa Streams?"**
+Porque **produzir é igual nas duas abordagens**. Streams é sobre **processar**.
+
+**"Vale a pena o time aprender? Qual o custo?"**
+A curva existe: KStream, KTable, serdes, event-time. Uma a duas semanas para
+ficar produtivo. **Vale se a gente tiver casos com estado.** Se não tiver, não vale.
+
+**"Temos algum caso real nosso que se encaixa?"**
+👉 **Prepare essa resposta antes.** Pense em 1 ou 2 casos concretos do nosso
+domínio (detecção de fraude por janela, contadores por cliente, enriquecimento
+juntando dois tópicos, agregações para dashboard). É o que transforma a
+apresentação em decisão.
+
+## 🎯 Sobre a demo
+
+**"Por que os números dos dois batem antes, mas não depois do restart?"**
+Porque o padrão perdeu o `Map` da memória e recomeçou do zero; o Streams
+reconstruiu o estado a partir do Kafka. **É esse o ponto da demo.**
+
+**"Essa janela de 5 minutos é do relógio ou do evento?"**
+No Streams, do **evento** (event-time) — usa o timestamp da mensagem. No consumer
+padrão, eu usei o timestamp da transação também, mas **na mão**. Se eu tivesse
+usado o relógio do servidor (o natural), uma mensagem atrasada cairia na **janela
+errada**.
+
+**"E se chegar uma mensagem muito atrasada?"**
+O Streams tem *grace period* — você configura quanto tempo esperar por eventos
+atrasados antes de fechar a janela. Aqui usei `ofSizeWithNoGrace` (sem tolerância)
+para simplificar.
+
+**"E exactly-once, funciona mesmo?"**
+Uma linha: `processing.guarantee=exactly_once_v2`. Na lib padrão, é um trabalho
+considerável de transações manuais. **Não usei nesta POC** para não poluir o
+código — mas está a uma config de distância.
