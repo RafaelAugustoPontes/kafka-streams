@@ -1,243 +1,298 @@
 # 📊 Kafka Streams vs. Lib Padrão — Demo para o Time
 
-Projeto de demonstração para apresentar **Kafka Streams**, comparando-o com a
-**biblioteca padrão** (`kafka-clients`) num cenário de **mercado financeiro**.
+> **Em uma frase:** um producer gera **transações financeiras** e dois consumidores
+> aplicam **as mesmas duas regras** — um usando a **lib padrão** do Kafka e outro
+> usando **Kafka Streams**. O objetivo é ver o mesmo problema resolvido das duas
+> formas e entender **quando vale a pena cada uma**.
 
-Um *producer* gera negociações (trades) de ações da B3 e **dois consumidores
-fazem a mesma tarefa** — calcular preço médio, VWAP, mínimo, máximo e volume por
-papel em janelas de 10 segundos — um usando a lib padrão e outro usando Kafka
-Streams. O objetivo é **ver o mesmo problema resolvido das duas formas** e
-comparar o esforço.
+📖 Para apresentar, siga o passo a passo do [ROTEIRO.md](ROTEIRO.md).
+
+---
+
+## 💰 O cenário
+
+Um sistema de pagamentos gerando **1 transação por segundo**, de 5 contas
+(`ACC-001` a `ACC-005`). Cada transação é uma mensagem JSON no tópico
+`transactions`:
+
+```json
+{ "id": "TX-0042", "accountId": "ACC-003", "amount": 12500.00, "timestamp": 1720000000000 }
+```
+
+A **chave** da mensagem é o `accountId` — assim todas as transações de uma conta
+caem na mesma partição e podem ser agrupadas.
+
+### As duas regras que os consumidores aplicam
+
+| | Regra | O que ela exige |
+|---|---|---|
+| **1️⃣** | Transação **acima de R$ 10.000** → dispara um **ALERTA** | Só olhar a mensagem atual. **Sem estado.** |
+| **2️⃣** | **Contar** as transações de cada conta em **janelas de 5 minutos** | Precisa **lembrar** das mensagens anteriores. **Com estado.** |
+
+> 🔑 **Essa é a chave da apresentação inteira.** A Regra 1 é fácil nas duas
+> abordagens. É a **Regra 2** que separa as duas ferramentas.
+
+---
+
+## 🧩 Primeiro: o que a lib padrão faz (e o que não faz)
+
+Quando falamos "lib padrão", falamos do **`kafka-clients`** — o que todo mundo já usa:
+
+- **`KafkaProducer`** → envia mensagens para um tópico.
+- **`KafkaConsumer`** → busca mensagens num loop de `poll()`.
+
+Ela é ótima. Mas repare no que ela **não** faz por você:
+
+- ❌ Não guarda **estado**. Precisa contar, somar ou lembrar do passado?
+  O acumulador é problema seu.
+- ❌ Não entende **janela de tempo**. "Nos últimos 5 minutos" você calcula na mão.
+- ❌ Não **recupera** nada se a aplicação cair e voltar. O que estava na memória, morreu.
+
+Para "ler mensagem → chamar API → gravar no banco", nada disso importa.
+**O problema começa quando o consumo precisa lembrar do passado.**
 
 ---
 
 ## 🎯 O que é Kafka Streams?
 
-- É uma **biblioteca Java** (não um cluster, não um servidor) para processar
-  streams de dados **em cima do Kafka**.
-- Você adiciona uma dependência, escreve uma **topologia** (o "passo a passo" do
-  processamento) e roda como uma aplicação Java comum.
-- Foi feita para **transformar, agregar, juntar e enriquecer** eventos em tempo
-  real — não só ler/escrever mensagens.
-- Conceitos centrais:
-  - **KStream** → um fluxo infinito de eventos (cada trade é um evento).
-  - **KTable** → a "foto" atual de um estado (o último valor por chave).
-  - **State Store** → estado local (ex.: RocksDB) com backup automático em
-    tópicos internos do Kafka → **tolerância a falhas de graça**.
-  - **Windowing** → agrupar eventos por janelas de tempo (tumbling, hopping,
-    session…).
-  - **Event-time** → processa pelo horário do evento, não pelo relógio do servidor.
+- É uma **biblioteca Java** — você adiciona **uma dependência** no `pom.xml`.
+  **Não** é servidor, **não** é cluster, **não** tem nada para instalar.
+- Sua aplicação continua um Java comum (`public static void main`), rodando
+  em container, VM ou Kubernetes.
+- A diferença é **como você escreve o processamento**: em vez de um loop de
+  `poll()` com lógica manual, você **descreve** o que quer (a *topologia*):
+
+  ```
+  pegue o fluxo → agrupe por conta → janele em 5 min → conte
+  ```
+
+- Você diz **O QUE** quer. A biblioteca resolve **COMO**: estado, tempo,
+  falhas e paralelismo.
+
+### O superpoder: o State Store
+
+Quando você usa `count()`, `aggregate()` ou um `join`, o Streams guarda o
+resultado parcial num **State Store**:
+
+- fica **local** (rápido) — mas com **backup automático em um tópico interno do Kafka**;
+- se a aplicação **cair e subir de novo**, ela **recupera o estado** e continua
+  de onde parou.
+
+É exatamente isso que o `Map` em memória do consumer padrão **não** consegue fazer.
 
 ---
 
-## 🆚 Kafka Streams vs. Lib Padrão (`kafka-clients`)
+## 🆚 O contraste em código
 
-| Aspecto | Lib padrão (Producer/Consumer) | Kafka Streams |
+### Regra 1 (sem estado) — praticamente igual nas duas
+
+```java
+// LIB PADRÃO — dentro do loop de poll
+if (tx.amount() > 10_000) {
+    System.out.println("*** ALERTA *** " + tx.id());
+}
+```
+
+```java
+// KAFKA STREAMS
+transacoes
+    .filter((conta, tx) -> tx.amount() > 10_000)
+    .foreach((conta, tx) -> System.out.println("*** ALERTA *** " + tx.id()));
+```
+
+> Empate. Para regra simples, a lib padrão resolve numerinho. **Não use Streams
+> só para isso.**
+
+### Regra 2 (com estado) — aqui a diferença aparece
+
+**Lib padrão** — eu preciso criar o estado, descobrir a janela **na mão** e zerar o
+contador **na mão** quando ela virar:
+
+```java
+// um Map na memória guardando o contador de cada conta
+Map<String, Contador> contadores = new HashMap<>();
+
+int contarNaJanela(Transaction tx) {
+    // em qual bloco de 5 minutos esta transação caiu?
+    long janelaAtual = tx.timestamp() / JANELA_MS;
+
+    Contador contador = contadores.computeIfAbsent(tx.accountId(), k -> new Contador());
+
+    // a janela virou? então zera o contador na mão
+    if (contador.janela != janelaAtual) {
+        contador.janela = janelaAtual;
+        contador.quantidade = 0;
+    }
+    return ++contador.quantidade;
+}
+// ⚠️ e se o processo reiniciar? Esse Map some. A contagem volta do zero.
+```
+
+**Kafka Streams** — a mesma regra, declarativa:
+
+```java
+transacoes
+    .groupByKey()                                              // agrupe por conta
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(ofMinutes(5)))   // janele em 5 min
+    .count()                                                   // conte
+    .toStream()
+    .foreach((conta, qtd) -> System.out.println(conta + " -> " + qtd));
+// ✅ o estado é salvo no Kafka. Reiniciou? Recupera e continua.
+```
+
+> Mesma regra de negócio. A diferença é **quem carrega o piano**: no primeiro
+> caso, você; no segundo, a biblioteca.
+
+---
+
+## 📋 A comparação, ponto a ponto
+
+| Aspecto | Lib padrão (`kafka-clients`) | Kafka Streams |
 |---|---|---|
-| **Nível de abstração** | Baixo: você controla poll, offsets, threads | Alto: descreve a transformação, ele executa |
-| **Estado (agregações)** | Você mantém na mão (Map, banco, cache…) | State Store nativo, com backup automático |
-| **Janela de tempo** | Feita manualmente (scheduler, controle de tempo) | `windowedBy(...)` pronto, com event-time |
-| **Tolerância a falhas** | Você resolve (perde o estado em memória num crash) | Estado recuperado dos tópicos internos |
-| **Exactly-once** | Configuração manual e trabalhosa | `processing.guarantee=exactly_once_v2` |
-| **Joins entre tópicos** | Você implementa toda a lógica | `join`, `leftJoin`, `outerJoin` prontos |
-| **Escala/paralelismo** | Você gerencia partições e threads | Escala por partição automaticamente |
-| **Linhas de código** | Muitas para lógica de estado | Poucas, declarativas |
-| **Curva de aprendizado** | Baixa para casos simples | Média (conceitos de stream/table/tempo) |
-
-> 👉 **Neste projeto** os dois consumidores fazem *a mesma agregação em janela*.
-> Compare [`StandardConsumerApp`](consumer-standard/src/main/java/com/example/standard/StandardConsumerApp.java)
-> com [`StreamsConsumerApp`](consumer-streams/src/main/java/com/example/streams/StreamsConsumerApp.java):
-> a versão Streams cabe numa única topologia, enquanto a padrão precisa de
-> `Map` + `scheduler` + sincronização de threads — e **ainda perde o estado num
-> restart**.
+| **Estilo** | Imperativo: você escreve o loop e a lógica | Declarativo: você descreve a transformação |
+| **Regra sem estado** (alerta) | ✅ Simples e direto | ✅ Simples e direto (empate) |
+| **Regra com estado** (contagem) | Você cria e mantém o `Map` na mão | `count()` — a lib cuida do estado |
+| **Janela de tempo** | Cálculo manual (limpar o que expirou) | `windowedBy(5 min)` — uma linha |
+| **App reiniciou, e o estado?** | 💀 Perdeu tudo. Contagem do zero. | ✅ Recupera do Kafka e continua |
+| **Mensagem atrasada** | Entra na conta errada (usa o relógio local) | Entra na janela certa (usa o horário do evento) |
+| **Exactly-once** | Transações manuais, trabalhoso | 1 config: `processing.guarantee=exactly_once_v2` |
+| **Join entre tópicos** | Você implementa tudo | `join` / `leftJoin` prontos |
+| **Escalar** | Você coordena instâncias e partições | Sobe outra instância — rebalance automático |
+| **Curva de aprendizado** | Baixa | Média |
 
 ---
 
 ## ✅ Vantagens do Kafka Streams
 
-- **Menos código para lógica de estado** — agregações, contagens e janelas são
-  operações de primeira classe.
-- **Tolerância a falhas embutida** — o estado é replicado em tópicos internos;
-  se o app cai e sobe de novo, ele **recupera de onde parou**.
-- **Event-time e janelas prontas** — lida com eventos fora de ordem e dados
-  atrasados (grace period) sem você reinventar isso.
-- **Exactly-once semantics** — com uma linha de configuração.
-- **Joins e enriquecimento** — juntar dois streams ou stream + tabela é trivial.
-- **Escala horizontal** — suba mais instâncias com o mesmo `application.id` e o
-  Kafka rebalanceia as partições automaticamente.
-- **Sem cluster extra** — é só uma lib; roda em qualquer lugar que rode um JAR.
+- **Estado sem esforço** — contar, somar, agrupar e janelar são operações prontas.
+- **Estado à prova de falhas** — backup automático em tópico interno.
+  Dá para provar ao vivo (veja "A demonstração mais forte", abaixo).
+- **Entende tempo de verdade** — usa o horário do **evento**, não o do servidor;
+  mensagem atrasada cai na janela correta.
+- **Exactly-once com 1 linha** de configuração.
+- **Escala sozinho** — instâncias com o mesmo `application.id` dividem as partições.
+- **Zero infraestrutura nova** — é só um JAR.
 
-## ❌ Desvantagens / Quando NÃO usar
+## ❌ Desvantagens / quando NÃO usar
 
-- **Curva de aprendizado** — KStream, KTable, event-time, janelas e serdes exigem
-  estudo; para "só ler e gravar", é overkill.
-- **Só Kafka** — a fonte e o destino precisam ser Kafka (não é um ETL genérico).
-- **Só JVM** — a lib é Java/Scala. Se o time é Python/Go, não se aplica direto.
-- **State Store consome disco/memória** — janelas grandes e muito estado pesam
-  (RocksDB, rebalanceamentos podem ficar lentos).
-- **Debug mais difícil** — a execução é assíncrona e distribuída; entender o que
-  aconteceu exige conhecer a topologia e os tópicos internos.
-- **Tópicos internos "escondidos"** — o Streams cria tópicos de repartition e
-  changelog; é preciso saber que eles existem para operar bem.
+- **Curva de aprendizado** — KStream, KTable, serdes, janelas... exige estudo.
+  Para "ler e gravar", é complexidade desnecessária.
+- **Só Kafka → Kafka** — entrada e saída são tópicos. Integrar com banco/API
+  externa é papel do seu código ou do Kafka Connect.
+- **Só JVM** — time Python ou Go precisa de outra solução.
+- **Estado ocupa disco e memória** — muitas chaves e janelas longas pesam.
+- **Debug menos óbvio** — a lib cria tópicos internos (*changelog*, *repartition*)
+  que você precisa conhecer para operar bem.
 
-### Regra de bolso
+## 🧭 Regra de bolso
 
-- **Lib padrão** → integração simples, ler mensagens e chamar um serviço/gravar
-  num banco, produtores, sem estado ou com estado externo simples.
-- **Kafka Streams** → agregações, janelas de tempo, joins, contadores, detecção
-  de padrões, pipelines de transformação **stateful** dentro do Kafka.
+- ✅ **Lib padrão** → consumo **sem estado**: ler mensagem → validar → chamar
+  serviço → gravar no banco. E **todos os producers**.
+- ✅ **Kafka Streams** → consumo **com estado**: contar, somar, agregar, janelar
+  por tempo, juntar dois tópicos, detectar padrões.
 
----
-
-## 💰 O cenário da demo (mercado financeiro)
-
-- **Tópico:** `stock-trades`
-- **Mensagem (JSON):**
-  ```json
-  { "ticker": "PETR4", "price": 38.42, "quantity": 1200, "timestamp": 1720000000000 }
-  ```
-- **Chave:** o `ticker` (garante ordem por papel e distribui entre partições).
-- **Papéis simulados:** PETR4, VALE3, ITUB4, BBDC4, MGLU3, WEGE3, ABEV3
-  (preços evoluem em *random walk*).
-- **Cálculo feito pelos dois consumidores (janela de 10s por papel):**
-  - Nº de trades
-  - Preço médio simples
-  - **VWAP** (preço médio ponderado pelo volume)
-  - Mínimo e máximo
-  - Volume total
-
-> Os dois consumidores estão em **grupos diferentes**, então **ambos recebem
-> todas as mensagens** e você vê os dois resultados lado a lado.
+> Nesta POC: se a gente só precisasse do **alerta** (Regra 1), Kafka Streams
+> seria exagero. É a **contagem por janela** (Regra 2) que justifica a troca.
 
 ---
 
 ## 🚀 Como rodar
 
-Pré-requisitos: **Docker** e **Docker Compose**. (Não precisa de Java/Maven na
-máquina — o build acontece dentro do Docker.)
+Pré-requisito: só **Docker** (não precisa de Java nem Maven — o build acontece
+dentro do container).
 
 ```bash
-# na raiz do projeto
 docker compose up --build
 ```
 
-Isso sobe: **Kafka** → **producer** → **consumer-standard** → **consumer-streams**.
-
-### Vendo a saída de cada serviço (recomendado para a apresentação)
+### Acompanhando (recomendado: 3 terminais)
 
 ```bash
-# em terminais separados:
-docker compose logs -f producer
-docker compose logs -f consumer-standard
-docker compose logs -f consumer-streams
+docker compose logs -f producer            # as transações sendo geradas
+docker compose logs -f consumer-standard   # as 2 regras, feitas na mão
+docker compose logs -f consumer-streams    # as 2 regras, com Kafka Streams
 ```
 
-- No **producer** você vê os trades sendo gerados.
-- No **consumer-standard** e no **consumer-streams**, a cada ~10s aparece a
-  tabela/linhas com a agregação por papel. **Compare os números** — devem bater.
+Os dois consumidores estão em **grupos diferentes**, então **ambos recebem todas
+as transações** — dá para comparar a saída lado a lado.
 
-### Para encerrar
+### 💥 A demonstração mais forte: tolerância a falhas
+
+Anote a contagem de uma conta nos dois consumidores e **destrua os dois
+containers** (disco zerado, não é um simples `restart`):
+
+```bash
+docker compose up -d --force-recreate consumer-standard consumer-streams
+```
+
+Depois de ~20s, compare a **mesma conta na mesma janela**:
+
+| | `ACC-002` na janela atual |
+|---|---|
+| 🔵 **consumer-standard** | **17** ← 💀 perdeu o `Map` da memória, recomeçou do zero |
+| 🟣 **consumer-streams** | **53** ← ✅ reconstruiu o estado a partir do Kafka e continuou |
+
+As ~36 transações de diferença são **exatamente o que o consumer padrão esqueceu**.
+O Streams subiu com o disco vazio e ainda assim voltou com o número certo — ele
+restaura o State Store a partir do **tópico interno de changelog**. Sem uma linha
+de código para isso.
+
+### Encerrando
 
 ```bash
 docker compose down
-```
-
-### Dica: inspecionar o tópico direto do host
-
-```bash
-docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic stock-trades --from-beginning
 ```
 
 ---
 
 ## 🗂️ Estrutura dos projetos
 
-Projeto **Maven multi-módulo**, Java 21, cada app vira um *fat-jar* e roda no seu
-próprio container.
+Projeto **Maven multi-módulo** (Java 21). Cada aplicação vira um *fat-jar* e roda
+no seu próprio container.
 
 ```
 kafka-streams/
-├── pom.xml                     # POM pai: versões, módulos, dependencyManagement
-├── docker-compose.yml          # sobe Kafka + os 3 apps
-├── .dockerignore
+├── pom.xml                     # POM pai: versões e módulos
+├── docker-compose.yml          # sobe Kafka (KRaft) + os 3 apps
+├── README.md                   # este arquivo
+├── ROTEIRO.md                  # passo a passo da apresentação
 │
-├── common/                     # código compartilhado
-│   ├── pom.xml
-│   └── src/main/java/com/example/common/
-│       ├── Trade.java          # record da negociação (o "evento")
-│       └── Json.java           # helper de (de)serialização JSON (Jackson)
+├── common/                     # 📦 compartilhado pelos 3 apps
+│   └── .../common/
+│       ├── Transaction.java    # o evento: id, conta, valor, horário
+│       └── Json.java           # helper de (de)serialização JSON
 │
-├── producer/                   # PRODUCER (lib padrão / KafkaProducer)
-│   ├── pom.xml
-│   ├── Dockerfile
-│   └── src/main/java/com/example/producer/
-│       └── ProducerApp.java    # gera trades e publica em 'stock-trades'
+├── producer/                   # 🟢 PRODUCER (lib padrão)
+│   └── .../producer/
+│       └── ProducerApp.java    # gera 1 transação/s; ~1 em 5 é acima de 10 mil
 │
-├── consumer-standard/          # CONSUMER com a LIB PADRÃO
-│   ├── pom.xml
-│   ├── Dockerfile
-│   └── src/main/java/com/example/standard/
-│       └── StandardConsumerApp.java   # poll + Map + scheduler = agregação na mão
+├── consumer-standard/          # 🔵 CONSUMER com a LIB PADRÃO
+│   └── .../standard/
+│       └── StandardConsumerApp.java  # loop de poll + Map manual + limpeza na mão
 │
-└── consumer-streams/           # CONSUMER com KAFKA STREAMS
-    ├── pom.xml
-    ├── Dockerfile
-    └── src/main/java/com/example/streams/
-        ├── StreamsConsumerApp.java    # a topologia (o coração da demo)
-        ├── WindowStats.java           # estado agregado por janela (imutável)
-        └── JsonSerde.java             # Serde JSON p/ Trade e WindowStats
+└── consumer-streams/           # 🟣 CONSUMER com KAFKA STREAMS
+    └── .../streams/
+        ├── StreamsConsumerApp.java   # a topologia: filter + groupByKey/count
+        └── JsonSerde.java            # ensina o Streams a ler/gravar JSON
 ```
 
-### Papel de cada módulo
+### O papel de cada módulo
 
-- **`common`** — o *record* `Trade` (o evento) e o utilitário `Json`. Reaproveitado
-  por todos, evita duplicação do modelo.
-- **`producer`** — usa a **lib padrão** (`KafkaProducer`) para publicar trades
-  continuamente. Mostra o lado "produtor" da comparação.
-- **`consumer-standard`** — usa a **lib padrão** (`KafkaConsumer`). A agregação em
-  janela é **feita à mão**: loop de `poll`, `Map` de acumuladores, um
-  `ScheduledExecutorService` para "fechar" a janela e `synchronized` para
-  coordenar as duas threads. Funciona, mas **é processing-time e não sobrevive a
-  um restart**.
-- **`consumer-streams`** — usa **Kafka Streams**. A mesma agregação vira uma
-  topologia declarativa:
-  `stream → groupByKey → windowedBy(10s) → aggregate → suppress → foreach`.
-  Ganha **event-time**, **estado tolerante a falhas** e **resultado final por
-  janela** sem código extra.
+- **`common`** — o `record Transaction` (o evento) e o helper `Json`.
+  Compartilhado para os três apps falarem a mesma língua.
+- **`producer`** — usa a lib padrão (`KafkaProducer`) para publicar transações.
+  Mostra que **produzir é igual nas duas abordagens**.
+- **`consumer-standard`** — usa `KafkaConsumer`. A Regra 1 é um `if`; a Regra 2
+  exige um `Map` na memória, calcular **na mão** em qual janela a transação caiu
+  e **zerar o contador na mão** quando ela vira. Funciona — mas **perde tudo num
+  restart**.
+- **`consumer-streams`** — usa Kafka Streams. A Regra 1 é um `filter`; a Regra 2
+  é `groupByKey().windowedBy(5min).count()`. **Sem estado manual, com recuperação
+  automática.**
 
-### Trecho-chave para mostrar na apresentação
+---
 
-**Lib padrão** — só o "esqueleto" da janela manual:
-
-```java
-// thread de poll
-while (running) {
-    var records = consumer.poll(Duration.ofMillis(500));
-    for (var rec : records) {
-        Trade t = Json.fromJson(rec.value(), Trade.class);
-        synchronized (lock) {
-            window.computeIfAbsent(t.ticker(), k -> new Acc()).add(t);
-        }
-    }
-}
-// ...e uma thread SEPARADA só para fechar a janela a cada 10s
-scheduler.scheduleAtFixedRate(this::flushWindow, 10, 10, SECONDS);
-```
-
-**Kafka Streams** — a mesma agregação, declarativa:
-
-```java
-builder.stream(TOPIC, Consumed.with(Serdes.String(), tradeSerde))
-    .groupByKey(Grouped.with(Serdes.String(), tradeSerde))
-    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofSeconds(10)))
-    .aggregate(WindowStats::empty, (k, trade, stats) -> stats.add(trade), /* store */ )
-    .suppress(Suppressed.untilWindowCloses(BufferConfig.unbounded()))
-    .toStream()
-    .foreach((window, stats) -> print(window, stats));
-```
-
-> **Mensagem final para o time:** a lib padrão te dá controle total e é perfeita
-> para casos simples e produção de mensagens. O Kafka Streams brilha quando o
-> problema é **stateful** (agregar, janelar, juntar) — ele elimina justamente o
-> código chato e propenso a bugs de gerenciar estado, tempo e falhas.
+> 💡 **Mensagem final para o time:** a lib padrão dá controle total e é perfeita
+> para consumo **sem estado**. O Kafka Streams brilha quando o problema é
+> **stateful** — ele elimina exatamente o código chato e propenso a bugs de
+> gerenciar **estado**, **tempo** e **falha**. Escolham pela natureza do problema.

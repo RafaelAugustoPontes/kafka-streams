@@ -6,9 +6,13 @@ import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serializer;
 
 /**
- * Serde generico baseado em JSON (Jackson). O Kafka Streams precisa saber
- * (de)serializar tanto os valores do topico (Trade) quanto o estado agregado
- * (WindowStats) que ele guarda no state store / topicos internos.
+ * Serde = SERializer + DESerializer.
+ *
+ * O Kafka trafega bytes. Este "tradutor" ensina o Kafka Streams a converter
+ * os bytes do topico no nosso record Transaction (e vice-versa), usando JSON.
+ *
+ * Na lib padrao o equivalente e o StringDeserializer + a chamada manual ao
+ * Json.fromJson(...) dentro do loop.
  */
 public class JsonSerde<T> implements Serde<T> {
 

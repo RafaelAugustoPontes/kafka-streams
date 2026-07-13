@@ -1,12 +1,11 @@
 package com.example.standard;
 
 import com.example.common.Json;
-import com.example.common.Trade;
+import com.example.common.Transaction;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 
 import java.time.Duration;
@@ -14,35 +13,46 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.TreeMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
- * Consumidor usando a LIB PADRAO (kafka-clients / KafkaConsumer).
+ * ============================================================================
+ *  CONSUMIDOR COM A LIB PADRAO (kafka-clients / KafkaConsumer)
+ * ============================================================================
  *
- * Objetivo didatico: mostrar quanto codigo "na mao" e preciso para calcular
- * uma agregacao por janela de tempo (preco medio, VWAP, min, max e volume por
- * papel a cada 10s). Repare que precisamos gerenciar:
- *   - o loop de poll
- *   - o estado em memoria (o Map de acumuladores)
- *   - o disparo temporal da janela (um scheduler separado)
- *   - a sincronizacao entre a thread de poll e a thread do scheduler
+ * Faz DUAS coisas simples:
  *
- * Esta janela e por RELOGIO (processing-time) e NAO sobrevive a um restart:
- * se o processo cair, o estado acumulado se perde. Compare com o Kafka Streams.
+ *   REGRA 1 - Alerta de valor alto:
+ *             se a transacao for acima de R$ 10.000, imprime um ALERTA.
+ *
+ *   REGRA 2 - Contagem por conta:
+ *             quantas transacoes aquela conta fez na janela de 5 minutos.
+ *
+ * A REGRA 1 e facil: e so um "if" na mensagem que acabou de chegar.
+ * Nao preciso lembrar de nada. Aqui a lib padrao e perfeita.
+ *
+ * A REGRA 2 e o problema: para contar, eu preciso LEMBRAR das transacoes
+ * anteriores. Ou seja, preciso de ESTADO. E a lib padrao nao me da estado
+ * nenhum - eu tenho que:
+ *
+ *   1. criar um Map na memoria para guardar o contador de cada conta
+ *   2. descobrir na mao em qual janela de 5 minutos a transacao cai
+ *   3. zerar o contador na mao quando a janela virar
+ *   4. conviver com o fato de que, SE ESTE PROCESSO REINICIAR,
+ *      esse Map se PERDE e a contagem volta do zero.
+ *
+ * Guarde esse contraste: e exatamente isso que o Kafka Streams resolve.
  */
 public class StandardConsumerApp {
 
-    private static final String TOPIC = "stock-trades";
-    private static final long WINDOW_SECONDS = 10;
+    private static final String TOPIC = "transactions";
+    private static final double LIMITE_ALERTA = 10_000.00;
+    private static final long JANELA_MS = Duration.ofMinutes(5).toMillis();
 
-    // estado da janela atual: acumulador por ticker
-    private static final Map<String, Acc> window = new HashMap<>();
-    private static final Object lock = new Object();
-
-    private static volatile boolean running = true;
+    /**
+     * O ESTADO, mantido na mao: o contador de cada conta.
+     * Vive apenas na memoria deste processo - reiniciou, perdeu.
+     */
+    private static final Map<String, Contador> contadores = new HashMap<>();
 
     public static void main(String[] args) {
         String bootstrap = System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092");
@@ -52,91 +62,72 @@ public class StandardConsumerApp {
         props.put(ConsumerConfig.GROUP_ID_CONFIG, "standard-consumer-group");
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
-        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "true");
+        // le o topico desde o inicio (assim a contagem bate com a do consumer-streams)
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
 
         KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
         consumer.subscribe(List.of(TOPIC));
 
-        // thread separada so para "fechar" a janela a cada 10 segundos
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-        scheduler.scheduleAtFixedRate(StandardConsumerApp::flushWindow,
-                WINDOW_SECONDS, WINDOW_SECONDS, TimeUnit.SECONDS);
-
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            running = false;
-            consumer.wakeup();
-        }));
-
         System.out.println("[STANDARD] Consumindo '" + TOPIC + "' (broker: " + bootstrap + ")");
-        System.out.println("[STANDARD] Agregacao manual a cada " + WINDOW_SECONDS + "s\n");
+        System.out.println("[STANDARD] Regra 1: alerta acima de R$ " + LIMITE_ALERTA);
+        System.out.println("[STANDARD] Regra 2: contagem por conta em janelas de 5 min\n");
 
-        try {
-            while (running) {
-                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
-                for (ConsumerRecord<String, String> record : records) {
-                    Trade trade = Json.fromJson(record.value(), Trade.class);
-                    synchronized (lock) {
-                        window.computeIfAbsent(trade.ticker(), k -> new Acc()).add(trade);
-                    }
+        // O LOOP DE POLL: eu que busco as mensagens, eu que trato uma por uma.
+        while (true) {
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
+
+            for (ConsumerRecord<String, String> record : records) {
+                Transaction tx = Json.fromJson(record.value(), Transaction.class);
+
+                // ----------------------------------------------------------
+                // REGRA 1: valor alto? Basta olhar a mensagem atual. Simples.
+                // ----------------------------------------------------------
+                if (tx.amount() > LIMITE_ALERTA) {
+                    System.out.printf("[STANDARD] *** ALERTA *** %s | %s | R$ %.2f acima do limite!%n",
+                            tx.id(), tx.accountId(), tx.amount());
                 }
+
+                // ----------------------------------------------------------
+                // REGRA 2: contar por conta na janela de 5 min.
+                //          Aqui eu preciso de ESTADO - e mante-lo e por minha conta.
+                // ----------------------------------------------------------
+                int quantidade = contarNaJanela(tx);
+
+                System.out.printf("[STANDARD] %s | %s | R$ %10.2f | %d transacao(oes) na janela de 5 min%n",
+                        tx.id(), tx.accountId(), tx.amount(), quantidade);
             }
-        } catch (WakeupException e) {
-            // esperado no shutdown
-        } finally {
-            consumer.close();
-            scheduler.shutdown();
-            System.out.println("[STANDARD] Encerrado.");
         }
     }
 
-    /** "Fecha" a janela: tira um snapshot do estado, zera e imprime o resultado. */
-    private static void flushWindow() {
-        Map<String, Acc> snapshot;
-        synchronized (lock) {
-            snapshot = new TreeMap<>(window);
-            window.clear();
+    /**
+     * Conta as transacoes da conta dentro da janela de 5 minutos.
+     *
+     * Repare em TODO o trabalho manual que a lib padrao me obriga a fazer:
+     *   - descobrir em qual bloco de 5 minutos esta transacao caiu
+     *   - guardar o contador dessa conta no Map
+     *   - perceber que a janela virou e zerar o contador
+     *
+     * No consumer-streams isso tudo e UMA linha: .windowedBy(...).count()
+     */
+    private static int contarNaJanela(Transaction tx) {
+        // em qual bloco de 5 minutos esta transacao caiu?
+        long janelaAtual = tx.timestamp() / JANELA_MS;
+
+        Contador contador = contadores.computeIfAbsent(tx.accountId(), k -> new Contador());
+
+        // a janela virou? entao zera o contador e comeca a contar de novo
+        if (contador.janela != janelaAtual) {
+            contador.janela = janelaAtual;
+            contador.quantidade = 0;
         }
 
-        if (snapshot.isEmpty()) {
-            System.out.println("[STANDARD] (janela sem trades)");
-            return;
-        }
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("\n[STANDARD] ===== Janela de ").append(WINDOW_SECONDS).append("s (calculada na mao) =====\n");
-        sb.append(String.format("%-7s | %6s | %10s | %10s | %10s | %10s | %10s%n",
-                "TICKER", "TRADES", "PRECO MED", "VWAP", "MIN", "MAX", "VOLUME"));
-        snapshot.forEach((ticker, acc) ->
-                sb.append(String.format("%-7s | %6d | %10.2f | %10.2f | %10.2f | %10.2f | %10d%n",
-                        ticker, acc.count, acc.avgPrice(), acc.vwap(), acc.min, acc.max, acc.sumVolume)));
-        System.out.print(sb);
+        contador.quantidade++;
+        return contador.quantidade;
     }
 
-    /** Acumulador manual das estatisticas de um papel dentro da janela. */
-    private static final class Acc {
-        long count;
-        double sumPrice;
-        double sumPriceVolume;
-        long sumVolume;
-        double min = Double.MAX_VALUE;
-        double max = Double.MIN_VALUE;
-
-        void add(Trade t) {
-            count++;
-            sumPrice += t.price();
-            sumPriceVolume += t.price() * t.quantity();
-            sumVolume += t.quantity();
-            min = Math.min(min, t.price());
-            max = Math.max(max, t.price());
-        }
-
-        double avgPrice() {
-            return count == 0 ? 0 : sumPrice / count;
-        }
-
-        double vwap() {
-            return sumVolume == 0 ? 0 : sumPriceVolume / sumVolume;
-        }
+    /** O contador de UMA conta: em qual janela ela esta e quantas transacoes fez nela. */
+    private static final class Contador {
+        long janela = -1;
+        int quantidade;
     }
 }

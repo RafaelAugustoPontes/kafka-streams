@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell(docker compose logs --tail 20 consumer-standard 2>&1)"
+      "PowerShell(docker compose logs --tail 20 consumer-standard 2>&1)",
+      "PowerShell(docker compose up --build -d consumer-standard consumer-streams 2>&1)",
+      "PowerShell(docker version --format '{{.Server.Version}}' 2>&1)",
+      "PowerShell(docker compose up --build -d 2>&1)",
+      "PowerShell(docker compose logs --tail 8 producer 2>&1)",
+      "PowerShell(docker compose logs --tail 14 consumer-standard 2>&1)",
+      "Bash(docker compose *)"
     ]
   }
 }
