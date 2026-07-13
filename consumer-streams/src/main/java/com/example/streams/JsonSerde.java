@@ -6,13 +6,8 @@ import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serializer;
 
 /**
- * Serde = SERializer + DESerializer.
- *
- * O Kafka trafega bytes. Este "tradutor" ensina o Kafka Streams a converter
- * os bytes do topico no nosso record Transaction (e vice-versa), usando JSON.
- *
- * Na lib padrao o equivalente e o StringDeserializer + a chamada manual ao
- * Json.fromJson(...) dentro do loop.
+ * Serde (serializer + deserializer) JSON: ensina o Kafka Streams a converter
+ * os bytes do topico no record Transaction, e vice-versa.
  */
 public class JsonSerde<T> implements Serde<T> {
 
